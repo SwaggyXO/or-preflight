@@ -26,20 +26,23 @@ type InboundRequest struct {
 }
 
 type AdvisoryCalcRequest struct {
-	ModelID      string   `json:"model_id"`
 	TouchedFiles []string `json:"touched_files"` 
 	PromptText   string   `json:"prompt_text"`
 	ExpectedOut  int      `json:"expected_out_tokens"`
 }
 
-type AdvisoryCalcResponse struct {
-	ModelName         string  `json:"model_name"`
-	CodebaseTokens    int     `json:"codebase_tokens"`
-	PromptTokens      int     `json:"prompt_tokens"`
-	TotalInputTokens  int     `json:"total_input_tokens"`
-	MaxContextCeiling int     `json:"max_context_ceiling"`
-	ContextOverflow   bool    `json:"context_overflow"`
-	EstimatedCost     float64 `json:"estimated_cost"`
+type ModelCostLine struct {
+	ModelID       string  `json:"model_id"`
+	FriendlyName  string  `json:"friendly_name"`
+	InputTokens   int     `json:"input_tokens"`
+	OutputTokens  int     `json:"output_tokens"`
+	ProjectedCost float64 `json:"projected_cost"`
+}
+
+type MultiAgentTeamResponse struct {
+	PlannerLine   ModelCostLine `json:"planner_step"`
+	ExecutorLine  ModelCostLine `json:"executor_step"`
+	CombinedTotal float64       `json:"combined_total_task_cost"`
 }
 
 func StartProxyServer(cfg *config.AppConfig) {
@@ -50,7 +53,7 @@ func StartProxyServer(cfg *config.AppConfig) {
 		handleStatusCheck(w)
 	})
 	http.HandleFunc("/api/v1/preflight/calc", func(w http.ResponseWriter, r *http.Request) {
-		handleAdvisoryCalculation(w, r)
+		handleAdvisoryCalculation(w, r, cfg)
 	})
 }
 
@@ -184,7 +187,7 @@ func handleChatCompletion(w http.ResponseWriter, r *http.Request, cfg *config.Ap
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func handleAdvisoryCalculation(w http.ResponseWriter, r *http.Request) {
+func handleAdvisoryCalculation(w http.ResponseWriter, r *http.Request, cfg *config.AppConfig) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -197,11 +200,12 @@ func handleAdvisoryCalculation(w http.ResponseWriter, r *http.Request) {
 	}
 
 	config.Registry.RLock()
-	specs, exists := config.Registry.Models[req.ModelID]
+	plannerSpecs, plannerExists := config.Registry.Models[cfg.PlannerModel]
+	executorSpecs, executorExists := config.Registry.Models[cfg.ExecutorModel]
 	config.Registry.RUnlock()
 
-	if !exists {
-		http.Error(w, fmt.Sprintf("[ADVISOR REJECTION] Model '%s' is missing from the active synchronized registry map.", req.ModelID), http.StatusUnprocessableEntity)
+	if !plannerExists || !executorExists {
+		http.Error(w, fmt.Sprintf("[Advisor Error] One or both configured team models are missing from the dynamic registry. (Planner: '%s', Executor: '%s')", cfg.PlannerModel, cfg.ExecutorModel), http.StatusUnprocessableEntity)
 		return
 	}
 
@@ -219,28 +223,37 @@ func handleAdvisoryCalculation(w http.ResponseWriter, r *http.Request) {
 	indexer.CurrentState.RUnlock()
 
 	promptTokens := len(req.PromptText) / 4
-	totalInput := promptTokens + targetedCodebaseTokens
-	
 	outputBudget := req.ExpectedOut
 	if outputBudget == 0 {
 		outputBudget = 4000 
 	}
 
-	inputCost := float64(totalInput) * (specs.InputCostPerM / 1000000.0)
-	outputCost := float64(outputBudget) * (specs.OutputCostPerM / 1000000.0)
-	
-	resp := AdvisoryCalcResponse{
-		ModelName:         specs.FriendlyName,
-		CodebaseTokens:    targetedCodebaseTokens,
-		PromptTokens:      promptTokens,
-		TotalInputTokens:  totalInput,
-		MaxContextCeiling: specs.MaxContextWindow,
-		ContextOverflow:   totalInput > specs.MaxContextWindow,
-		EstimatedCost:     inputCost + outputCost,
+	plannerInputTokens := promptTokens + targetedCodebaseTokens
+	plannerCost := float64(plannerInputTokens)*(plannerSpecs.InputCostPerM/1000000.0) + float64(outputBudget)*(plannerSpecs.OutputCostPerM/1000000.0)
+
+	executorInputTokens := promptTokens + targetedCodebaseTokens + outputBudget
+	executorCost := float64(executorInputTokens)*(executorSpecs.InputCostPerM/1000000.0) + float64(outputBudget)*(executorSpecs.OutputCostPerM/1000000.0)
+
+	responsePayload := MultiAgentTeamResponse{
+		PlannerLine: ModelCostLine{
+			ModelID:       plannerSpecs.ID,
+			FriendlyName:  plannerSpecs.FriendlyName,
+			InputTokens:   plannerInputTokens,
+			OutputTokens:  outputBudget,
+			ProjectedCost: plannerCost,
+		},
+		ExecutorLine: ModelCostLine{
+			ModelID:       executorSpecs.ID,
+			FriendlyName:  executorSpecs.FriendlyName,
+			InputTokens:   executorInputTokens,
+			OutputTokens:  outputBudget,
+			ProjectedCost: executorCost,
+		},
+		CombinedTotal: plannerCost + executorCost,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	_ = json.NewEncoder(w).Encode(responsePayload)
 }
 
 func handleStatusCheck(w http.ResponseWriter) {

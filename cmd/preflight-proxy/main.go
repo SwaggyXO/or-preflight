@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 
 	"or-preflight/internal/config"
@@ -13,17 +12,18 @@ import (
 )
 
 func main() {
-	fmt.Println("[Debug] Raw OS Lookup:", os.Getenv("PREFLIGHT_WATCH_DIRS"))
+	config.SynchronizeUpstreamRates()
 	cfg := config.LoadConfig()
 
 	fmt.Println("🚀 INITIALIZING OPENROUTER PRE-FLIGHT COST ENFORCER DAEMON...")
 	fmt.Println("==================================================================")
 	fmt.Printf(" Target Execution Port : %s\n", cfg.ProxyPort)
 	fmt.Printf(" Simulation Sandbox Mode: %t\n", cfg.SimulationMode)
+	fmt.Printf(" Configured Planner    : %s\n", cfg.PlannerModel)
+	fmt.Printf(" Configured Executor   : %s\n", cfg.ExecutorModel)
 	
 	if cfg.SimulationMode {
 		fmt.Printf(" Offline Eval Routing  : Forwarding payloads to local Ollama (%s)\n", cfg.OllamaEndpoint)
-		fmt.Printf(" Cost Prediction Target: Evaluated against rates for %s\n", cfg.TargetEvalModel)
 	} else {
 		fmt.Println(" Upstream API Target   : Production Mode -> Routing to live OpenRouter Gateways")
 	}
@@ -33,7 +33,7 @@ func main() {
 
 	fmt.Println("\n[Indexer] Launching parallel workspace scanning threads...")
 	indexer.StartBackgroundIndex(cfg.WatchDirectories)
-
+	
 	indexer.CurrentState.RLock()
 	fmt.Println("[Indexer] Initial codebase sweep complete. Current Memory Cache State:")
 	var totalTokens int

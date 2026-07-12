@@ -25,12 +25,32 @@ type InboundRequest struct {
 	MaxTokens int           `json:"max_tokens,omitempty"`
 }
 
+type AdvisoryCalcRequest struct {
+	ModelID      string   `json:"model_id"`
+	TouchedFiles []string `json:"touched_files"` 
+	PromptText   string   `json:"prompt_text"`
+	ExpectedOut  int      `json:"expected_out_tokens"`
+}
+
+type AdvisoryCalcResponse struct {
+	ModelName         string  `json:"model_name"`
+	CodebaseTokens    int     `json:"codebase_tokens"`
+	PromptTokens      int     `json:"prompt_tokens"`
+	TotalInputTokens  int     `json:"total_input_tokens"`
+	MaxContextCeiling int     `json:"max_context_ceiling"`
+	ContextOverflow   bool    `json:"context_overflow"`
+	EstimatedCost     float64 `json:"estimated_cost"`
+}
+
 func StartProxyServer(cfg *config.AppConfig) {
 	http.HandleFunc("/api/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		handleChatCompletion(w, r, cfg)
 	})
 	http.HandleFunc("/api/v1/preflight/status", func(w http.ResponseWriter, r *http.Request) {
 		handleStatusCheck(w)
+	})
+	http.HandleFunc("/api/v1/preflight/calc", func(w http.ResponseWriter, r *http.Request) {
+		handleAdvisoryCalculation(w, r)
 	})
 }
 
@@ -58,24 +78,19 @@ func handleChatCompletion(w http.ResponseWriter, r *http.Request, cfg *config.Ap
 	}
 	promptTokens := len(combinedText.String()) / 4
 
-	targetModelID := req.Model
-	if cfg.SimulationMode {
-		targetModelID = cfg.TargetEvalModel
-	}
-
 	config.Registry.RLock()
-	specs, exists := config.Registry.Models[targetModelID]
+	specs, exists := config.Registry.Models[req.Model]
 	config.Registry.RUnlock()
 
 	if !exists {
-		errMsg := fmt.Sprintf("[PRE-FLIGHT REJECTION] The requested model token identity '%s' is completely absent from the local synchronized catalog registry. Aborting transaction to shield budget thresholds.", targetModelID)
+		errMsg := fmt.Sprintf("[CRITICAL PRE-FLIGHT REJECTION] Model '%s' is absent from the live synchronized pricing registry. Request blocked to prevent uncalculated costs.", req.Model)
 		fmt.Printf("\n🛑 %s\n", errMsg)
 		http.Error(w, errMsg, http.StatusUnprocessableEntity)
 		return
 	}
 
 	if specs.MaxContextWindow <= 0 {
-		errMsg := fmt.Sprintf("[PRE-FLIGHT REJECTION] Model structure '%s' exhibits an uninitialized or broken context ceiling parameter (<= 0 tokens) from upstream metadata. Request dropped to protect transaction safety.", targetModelID)
+		errMsg := fmt.Sprintf("[CRITICAL PRE-FLIGHT REJECTION] Model '%s' contains an invalid or missing context ceiling (<= 0). Request blocked.", req.Model)
 		fmt.Printf("\n🛑 %s\n", errMsg)
 		http.Error(w, errMsg, http.StatusInternalServerError)
 		return
@@ -91,8 +106,8 @@ func handleChatCompletion(w http.ResponseWriter, r *http.Request, cfg *config.Ap
 	totalEstimatedInput := promptTokens + registeredCodebaseTokens
 
 	if totalEstimatedInput > specs.MaxContextWindow {
-		errMsg := fmt.Sprintf("[PRE-FLIGHT OVERFLOW REJECTION] Total structural input [%d tokens] (Prompt: %d, Codebase: %d) violates the strict architectural context limit window [%d tokens] declared for %s.", 
-			totalEstimatedInput, promptTokens, registeredCodebaseTokens, specs.MaxContextWindow, specs.FriendlyName)
+		errMsg := fmt.Sprintf("[PRE-FLIGHT OVERFLOW] Input [%d tokens] violates strict context limit [%d tokens] for %s.", 
+			totalEstimatedInput, specs.MaxContextWindow, specs.FriendlyName)
 		fmt.Printf("\n⚠️  %s\n", errMsg)
 		http.Error(w, errMsg, http.StatusUnprocessableEntity)
 		return
@@ -100,11 +115,10 @@ func handleChatCompletion(w http.ResponseWriter, r *http.Request, cfg *config.Ap
 
 	outputBudget := req.MaxTokens
 	if outputBudget == 0 {
-		outputBudget = 4000
+		outputBudget = 4000 
 	}
 
 	isCacheHit := EvaluatePromptCache(req.Messages)
-	
 	var calculatedInputCost float64
 	displayName := specs.FriendlyName
 
@@ -119,14 +133,12 @@ func handleChatCompletion(w http.ResponseWriter, r *http.Request, cfg *config.Ap
 	estimatedOutputCost := float64(outputBudget) * (specs.OutputCostPerM / 1000000.0)
 	totalProjectedCost := calculatedInputCost + estimatedOutputCost
 
-	// 6. Interactive verification checkpoint via controlling TTY
 	authorized := tty.PromptUserInteractively(displayName, totalEstimatedInput, outputBudget, totalProjectedCost)
 	if !authorized {
 		http.Error(w, "Query rejected by user at pre-flight terminal check.", http.StatusForbidden)
 		return
 	}
 
-	// 7. Route connection traffic onward
 	var targetURL string
 	if cfg.SimulationMode {
 		targetURL = cfg.OllamaEndpoint + "/v1/chat/completions"
@@ -170,6 +182,65 @@ func handleChatCompletion(w http.ResponseWriter, r *http.Request, cfg *config.Ap
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func handleAdvisoryCalculation(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req AdvisoryCalcRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Malformed JSON request payload", http.StatusBadRequest)
+		return
+	}
+
+	config.Registry.RLock()
+	specs, exists := config.Registry.Models[req.ModelID]
+	config.Registry.RUnlock()
+
+	if !exists {
+		http.Error(w, fmt.Sprintf("[ADVISOR REJECTION] Model '%s' is missing from the active synchronized registry map.", req.ModelID), http.StatusUnprocessableEntity)
+		return
+	}
+
+	var targetedCodebaseTokens int
+	indexer.CurrentState.RLock()
+	for _, fileKey := range req.TouchedFiles {
+		normalizedKey := strings.ToLower(fileKey)
+		for topKey, metrics := range indexer.CurrentState.Topology {
+			if strings.Contains(topKey, normalizedKey) {
+				targetedCodebaseTokens += metrics.TokenCount
+				break
+			}
+		}
+	}
+	indexer.CurrentState.RUnlock()
+
+	promptTokens := len(req.PromptText) / 4
+	totalInput := promptTokens + targetedCodebaseTokens
+	
+	outputBudget := req.ExpectedOut
+	if outputBudget == 0 {
+		outputBudget = 4000 
+	}
+
+	inputCost := float64(totalInput) * (specs.InputCostPerM / 1000000.0)
+	outputCost := float64(outputBudget) * (specs.OutputCostPerM / 1000000.0)
+	
+	resp := AdvisoryCalcResponse{
+		ModelName:         specs.FriendlyName,
+		CodebaseTokens:    targetedCodebaseTokens,
+		PromptTokens:      promptTokens,
+		TotalInputTokens:  totalInput,
+		MaxContextCeiling: specs.MaxContextWindow,
+		ContextOverflow:   totalInput > specs.MaxContextWindow,
+		EstimatedCost:     inputCost + outputCost,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func handleStatusCheck(w http.ResponseWriter) {

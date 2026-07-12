@@ -25,7 +25,8 @@ type AppConfig struct {
 	ProxyPort        string
 	SimulationMode   bool
 	OllamaEndpoint   string
-	TargetEvalModel  string
+	PlannerModel     string 
+	ExecutorModel    string 
 	WatchDirectories []string
 }
 
@@ -44,7 +45,7 @@ func SynchronizeUpstreamRates() {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get("https://openrouter.ai/api/v1/models")
 	if err != nil {
-		fmt.Printf("[CRITICAL] Failed to fetch live pricing metrics from OpenRouter: %v. Server running with zero authorized models.\n", err)
+		fmt.Printf("[CRITICAL] OpenRouter edge endpoint unreachable: %v. Catalog synchronization failed.\n", err)
 		return
 	}
 	defer resp.Body.Close()
@@ -66,7 +67,7 @@ func SynchronizeUpstreamRates() {
 
 	var payload APIResponse
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		fmt.Printf("[CRITICAL] Corrupted catalog schema returned from OpenRouter edge: %v. Registration aborted.\n", err)
+		fmt.Printf("[CRITICAL] Upstream catalog payload corrupted: %v. Sync aborted.\n", err)
 		return
 	}
 
@@ -91,12 +92,12 @@ func SynchronizeUpstreamRates() {
 			MaxContextWindow:  m.ContextLength,
 		}
 	}
-	fmt.Printf("[Config] Ingested %d active model specs. Ready for deployment execution cycles.\n", len(Registry.Models))
+	fmt.Printf("[Config] Ingested %d dynamic upstream model specs successfully.\n", len(Registry.Models))
 }
 
 func LoadConfig() *AppConfig {
 	proxyPort := getEnv("PREFLIGHT_PORT", "8080")
-	simModeStr := getEnv("PREFLIGHT_SIMULATION", "true")
+	simModeStr := getEnv("PREFLIGHT_SIMULATION", "false")
 	isSimulation := strings.ToLower(simModeStr) == "true"
 
 	dirsStr := os.Getenv("PREFLIGHT_WATCH_DIRS")
@@ -119,7 +120,8 @@ func LoadConfig() *AppConfig {
 		ProxyPort:        ":" + proxyPort,
 		SimulationMode:   isSimulation,
 		OllamaEndpoint:   getEnv("OLLAMA_HOST", "http://localhost:11434"),
-		TargetEvalModel:  getEnv("PREFLIGHT_EVAL_MODEL", "anthropic/claude-3.5-sonnet"),
+		PlannerModel:     os.Getenv("PREFLIGHT_PLANNER_MODEL"),
+		ExecutorModel:    os.Getenv("PREFLIGHT_EXECUTOR_MODEL"),
 		WatchDirectories: directories,
 	}
 }
